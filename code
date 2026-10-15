@@ -1,0 +1,838 @@
+import json
+import re
+import socket
+import time
+from collections import deque
+from functools import lru_cache
+
+import numpy as np
+import pychromecast
+import pyttsx3
+import requests
+import sounddevice as sd
+import whisper
+
+from llama_cpp import Llama
+from pychromecast.controllers.youtube import YouTubeController
+
+
+# ================= SETTINGS =================
+
+API_KEY = "AIzaSyAoWHzw4L7AuWR4wFrOLQr5BCbW5izdVek"
+
+TV_IP = "192.168.43.127"
+TV_NAME = "BRAVIA VU2"
+PSK = "2013"
+
+OUTER_FAN = ("192.168.1.34", 5600)
+INNER_FAN = ("192.168.1.33", 5600)
+
+MIC_DEVICE = 1
+SAMPLE_RATE = 16000
+
+# Lower if your voice is not detected.
+# Raise if background noise triggers recording.
+SPEECH_THRESHOLD = 0.015
+
+BLOCK_SECONDS = 0.05
+
+# Stop recording after 100 ms below the threshold.
+SILENCE_SECONDS = 0.10
+
+# Reject recordings containing less than 250 ms
+# of sound above the threshold, without using Whisper.
+MIN_ACTIVE_SECONDS = 0.25
+
+MAX_RECORD_SECONDS = 25
+WAKE_TIMEOUT_SECONDS = 15
+
+DEFAULT_VOLUME_STEP = 5
+APP_START_DELAY = 5
+
+LLM_MODEL_PATH = (
+    r"C:\Users\dell\Downloads\Phi-3-mini-4k-instruct-q4.gguf"
+)
+
+
+# ================= STATE =================
+
+http = requests.Session()
+sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+engine = pyttsx3.init()
+
+cast = None
+youtube = None
+youtube_uri = None
+selected_video = None
+selected_query = None
+llm = None
+
+
+def speak(text):
+    print(text)
+    engine.say(text)
+    engine.runAndWait()
+
+
+# ================= MICROPHONE =================
+
+def record_on_spike(timeout=None):
+    """
+    Returns:
+        None: No speech started before the timeout.
+        Empty array: Brief noise rejected.
+        Audio array: Ready for transcription.
+    """
+    block_size = int(SAMPLE_RATE * BLOCK_SECONDS)
+
+    quiet_limit = max(
+        1, int(np.ceil(SILENCE_SECONDS / BLOCK_SECONDS))
+    )
+
+    max_blocks = max(
+        1, int(MAX_RECORD_SECONDS / BLOCK_SECONDS)
+    )
+
+    # Preserve the beginning of the first word.
+    pre_audio = deque(maxlen=4)
+
+    chunks = []
+    recording = False
+    quiet_blocks = 0
+    active_blocks = 0
+    recorded_blocks = 0
+
+    deadline = (
+        None if timeout is None
+        else time.monotonic() + timeout
+    )
+
+    with sd.InputStream(
+        device=MIC_DEVICE,
+        samplerate=SAMPLE_RATE,
+        channels=1,
+        dtype="float32",
+        blocksize=block_size,
+    ) as stream:
+
+        while True:
+            if (
+                not recording
+                and deadline is not None
+                and time.monotonic() >= deadline
+            ):
+                return None
+
+            block, overflowed = stream.read(block_size)
+            block = block.copy()
+
+            if overflowed:
+                print("Warning: microphone audio overflow.")
+
+            volume = float(np.sqrt(np.mean(block * block)))
+            above_threshold = volume >= SPEECH_THRESHOLD
+
+            if not recording:
+                pre_audio.append(block)
+
+                if above_threshold:
+                    recording = True
+                    chunks.extend(pre_audio)
+                    active_blocks = 1
+                    recorded_blocks = 1
+                    print("Recording...")
+
+                continue
+
+            chunks.append(block)
+            recorded_blocks += 1
+
+            if above_threshold:
+                active_blocks += 1
+                quiet_blocks = 0
+            else:
+                quiet_blocks += 1
+
+            if quiet_blocks >= quiet_limit:
+                break
+
+            if recorded_blocks >= max_blocks:
+                print("Maximum recording length reached.")
+                break
+
+    active_seconds = active_blocks * BLOCK_SECONDS
+
+    if active_seconds < MIN_ACTIVE_SECONDS:
+        print("Brief noise ignored — skipping Whisper.")
+        return np.empty(0, dtype=np.float32)
+
+    return np.concatenate(chunks).flatten()
+
+
+# ================= SONY TV =================
+
+def sony_request(service, method, params=None):
+    response = http.post(
+        f"http://{TV_IP}/sony/{service}",
+        headers={"X-Auth-PSK": PSK},
+        json={
+            "method": method,
+            "params": [] if params is None else params,
+            "id": 1,
+            "version": "1.0",
+        },
+        timeout=10,
+    )
+
+    response.raise_for_status()
+    data = response.json()
+
+    if "error" in data:
+        raise RuntimeError(f"{method}: {data['error']}")
+
+    return data.get("result", [])
+
+
+def tv_power(on):
+    sony_request(
+        "system",
+        "setPowerStatus",
+        [{"status": on}],
+    )
+
+    print("TV power requested:", on)
+
+    if on:
+        time.sleep(APP_START_DELAY)
+
+
+def volume_change(amount):
+    sony_request(
+        "audio",
+        "setAudioVolume",
+        [{
+            "target": "speaker",
+            "volume": f"{amount:+d}",
+        }],
+    )
+    print("Volume change requested:", amount)
+
+
+def volume_set(level):
+    sony_request(
+        "audio",
+        "setAudioVolume",
+        [{
+            "target": "speaker",
+            "volume": str(level),
+        }],
+    )
+    print("Volume requested:", level)
+
+
+def mute(on):
+    sony_request(
+        "audio",
+        "setAudioMute",
+        [{"status": on}],
+    )
+    print("Mute requested:", on)
+
+
+# ================= FANS / LIGHTS =================
+
+def device_control(location, device, on):
+    address = OUTER_FAN if location == "outer" else INNER_FAN
+    key = "power" if device == "fan" else "led"
+
+    payload = json.dumps({key: on}).encode("utf-8")
+    sock.sendto(payload, address)
+
+    print(
+        f"Command sent: {location} {device} "
+        f"{'on' if on else 'off'}"
+    )
+
+
+# ================= YOUTUBE =================
+
+@lru_cache(maxsize=200)
+def search_youtube(query):
+    if not API_KEY or API_KEY == "PASTE_YOUR_YOUTUBE_API_KEY":
+        raise RuntimeError("Enter your YouTube API key first.")
+
+    response = http.get(
+        "https://www.googleapis.com/youtube/v3/search",
+        params={
+            "part": "id",
+            "q": query,
+            "type": "video",
+            "maxResults": 1,
+            "key": API_KEY,
+        },
+        timeout=15,
+    )
+
+    data = response.json()
+
+    if not response.ok:
+        raise RuntimeError(
+            data.get("error", {}).get(
+                "message", "YouTube search failed."
+            )
+        )
+
+    items = data.get("items", [])
+
+    if not items:
+        raise RuntimeError(f"No video found: {query}")
+
+    return items[0]["id"]["videoId"]
+
+
+def select_video(query):
+    global selected_video, selected_query
+
+    selected_video = None
+    selected_query = None
+    query = query.strip()
+
+    if not query:
+        raise ValueError("Say a song or video name.")
+
+    print("Searching:", query)
+
+    selected_video = search_youtube(query)
+    selected_query = query
+
+    print("First result selected:", selected_video)
+
+
+def open_youtube():
+    global youtube_uri
+
+    if youtube_uri is None:
+        result = sony_request(
+            "appControl", "getApplicationList"
+        )
+        apps = result[0] if result else []
+
+        app = next(
+            (
+                item for item in apps
+                if item.get("title", "").strip().casefold()
+                == "youtube"
+            ),
+            None,
+        )
+
+        if app is None:
+            raise RuntimeError("YouTube app not listed by TV.")
+
+        youtube_uri = app["uri"]
+
+    sony_request(
+        "appControl",
+        "setActiveApp",
+        [{"uri": youtube_uri}],
+    )
+
+    time.sleep(APP_START_DELAY)
+    print("YouTube opening requested.")
+
+
+def connect_cast():
+    global cast, youtube
+
+    if cast is not None:
+        return
+
+    casts, browser = pychromecast.get_listed_chromecasts(
+        friendly_names=[TV_NAME],
+        known_hosts=[TV_IP],
+    )
+
+    candidate = None
+
+    try:
+        if not casts:
+            raise RuntimeError("TV Cast not found.")
+
+        candidate = casts[0]
+        candidate.wait(timeout=15)
+
+        controller = YouTubeController()
+        candidate.register_handler(controller)
+
+        cast = candidate
+        youtube = controller
+
+    except Exception:
+        if candidate is not None:
+            candidate.disconnect()
+        raise
+
+    finally:
+        browser.stop_discovery()
+
+
+def play_selected():
+    global youtube
+
+    if selected_video is None:
+        raise ValueError("Search for a video first.")
+
+    connect_cast()
+    open_youtube()
+
+    cast.unregister_handler(youtube)
+
+    youtube = YouTubeController()
+    cast.register_handler(youtube)
+
+    youtube.launch()
+    time.sleep(APP_START_DELAY)
+
+    youtube.play_video(selected_video)
+    print("Playback requested:", selected_query)
+
+
+def search_and_play(query):
+    select_video(query)
+    play_selected()
+
+
+# ================= COMMAND PARSER =================
+
+NUMBER_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+    "hundred": 100,
+    "one hundred": 100,
+}
+
+
+def number_value(text):
+    text = text.strip().lower().replace("-", " ")
+
+    if text.isdigit():
+        return int(text)
+
+    if text in NUMBER_WORDS:
+        return NUMBER_WORDS[text]
+
+    parts = text.split()
+
+    if len(parts) == 2:
+        tens = NUMBER_WORDS.get(parts[0])
+        units = NUMBER_WORDS.get(parts[1])
+
+        if (
+            tens in range(20, 100, 10)
+            and units is not None
+            and 1 <= units <= 9
+        ):
+            return tens + units
+
+    raise ValueError(f"Unknown number: {text}")
+
+
+COMMAND_START = (
+    r"(?:"
+    r"turn\b|switch\b|"
+    r"(?:the\s+)?(?:outer|inner)\s+(?:fan|light|led)\b|"
+    r"(?:tv|television)\s+(?:on|off)\b|"
+    r"increase volume\b|decrease volume\b|"
+    r"volume\b|set volume\b|"
+    r"mute\b|unmute\b|"
+    r"open youtube\b|launch youtube\b|"
+    r"search\b|play\b|"
+    r"exit\b|quit\b|stop listening\b"
+    r")"
+)
+
+
+def split_commands(text):
+    separator = (
+        r"\s*;\s*(?:(?:and then|then|and)\s+)?"
+        r"|"
+        r"(?:\s*[, .!?]+\s*(?:(?:and then|then|and)\s+)?"
+        r"|\s+(?:and then|then|and)\s+)"
+        rf"(?={COMMAND_START})"
+    )
+
+    return [
+        part.strip()
+        for part in re.split(
+            separator, text, flags=re.IGNORECASE
+        )
+        if part.strip()
+    ]
+
+
+def parse_command(command):
+    command = command.strip().rstrip(".!?").strip()
+    lower = command.lower()
+
+    if lower in ("exit", "quit", "stop listening"):
+        return "exit", ()
+
+    match = re.fullmatch(
+        r"(?:turn|switch)\s+(on|off)\s+(?:the\s+)?"
+        r"(outer|inner)\s+(fan|light|led)",
+        lower,
+    )
+
+    if match:
+        state, location, device = match.groups()
+        return "device", (location, device, state == "on")
+
+    match = re.fullmatch(
+        r"(?:(?:turn|switch)\s+)?(?:the\s+)?"
+        r"(outer|inner)\s+(fan|light|led)\s+(on|off)",
+        lower,
+    )
+
+    if match:
+        location, device, state = match.groups()
+        return "device", (location, device, state == "on")
+
+    match = re.fullmatch(
+        r"(?:turn|switch)\s+(on|off)\s+"
+        r"(?:the\s+)?(?:tv|television)",
+        lower,
+    )
+
+    if match:
+        return "power", (match.group(1) == "on",)
+
+    match = re.fullmatch(
+        r"(?:(?:turn|switch)\s+)?(?:the\s+)?"
+        r"(?:tv|television)\s+(on|off)",
+        lower,
+    )
+
+    if match:
+        return "power", (match.group(1) == "on",)
+
+    match = re.fullmatch(
+        r"(increase volume|volume up|"
+        r"decrease volume|volume down)"
+        r"(?:\s+(?:by\s+)?(.+))?",
+        lower,
+    )
+
+    if match:
+        amount = (
+            number_value(match.group(2))
+            if match.group(2)
+            else DEFAULT_VOLUME_STEP
+        )
+
+        if not 1 <= amount <= 100:
+            raise ValueError("Volume change must be 1 to 100.")
+
+        if match.group(1) in ("decrease volume", "volume down"):
+            amount = -amount
+
+        return "volume_change", (amount,)
+
+    match = re.fullmatch(
+        r"(?:set volume(?: to)?|volume)\s+(.+)",
+        lower,
+    )
+
+    if match:
+        level = number_value(match.group(1))
+
+        if not 0 <= level <= 100:
+            raise ValueError("Volume must be 0 to 100.")
+
+        return "volume_set", (level,)
+
+    if lower in ("mute", "unmute"):
+        return "mute", (lower == "mute",)
+
+    if lower in ("open youtube", "launch youtube"):
+        return "open_youtube", ()
+
+    match = re.fullmatch(
+        r"search(?:\s+(?:youtube\s+for|for))?\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        return "search", (match.group(1),)
+
+    if lower in (
+        "play",
+        "play it",
+        "play first result",
+        "play the first result",
+        "play first video",
+        "play the first video",
+    ):
+        return "play_selected", ()
+
+    match = re.fullmatch(
+        r"play\s+(.+)",
+        command,
+        flags=re.IGNORECASE,
+    )
+
+    if match:
+        return "search_and_play", (match.group(1),)
+
+    raise ValueError(f"Unknown command: {command}")
+
+
+def run_commands(text):
+    commands = split_commands(text)
+
+    # Validate the whole sequence before operating devices.
+    actions = [parse_command(item) for item in commands]
+
+    handlers = {
+        "device": device_control,
+        "power": tv_power,
+        "volume_change": volume_change,
+        "volume_set": volume_set,
+        "mute": mute,
+        "open_youtube": open_youtube,
+        "search": select_video,
+        "play_selected": play_selected,
+        "search_and_play": search_and_play,
+    }
+
+    for index, (command, action_data) in enumerate(
+        zip(commands, actions), start=1
+    ):
+        action, args = action_data
+        print(f"[{index}/{len(commands)}] {command}")
+
+        if action == "exit":
+            speak("Exiting voice control.")
+            return True
+
+        try:
+            handlers[action](*args)
+
+        except Exception as error:
+            print("Sequence stopped:", error)
+            speak("I could not complete that command.")
+            return False
+
+    return False
+
+
+# ================= LOCAL AI =================
+
+def answer_question(question):
+    global llm
+
+    if llm is None:
+        print("Loading local AI model...")
+
+        llm = Llama(
+            model_path=LLM_MODEL_PATH,
+            n_ctx=2048,
+            verbose=False,
+        )
+
+    result = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Answer in one to three short sentences. "
+                    "You cannot operate devices. Never claim "
+                    "to have controlled any device."
+                ),
+            },
+            {"role": "user", "content": question},
+        ],
+        max_tokens=256,
+        temperature=0.4,
+    )
+
+    answer = (
+        result["choices"][0]["message"]["content"] or ""
+    ).strip()
+
+    if answer:
+        speak(answer)
+
+
+# ================= MAIN =================
+
+def main():
+    try:
+        print("Loading Whisper small...")
+        model = whisper.load_model("small")
+
+        print(
+            "\nVoice control ready.\n"
+            "Say 'Hey buddy' followed by your command.\n"
+            "Brief noises are ignored before transcription.\n"
+            "\nExamples:\n"
+            "Hey buddy, outer fan on and inner light off.\n"
+            "Hey buddy, volume twenty.\n"
+            "Hey buddy, increase volume and open YouTube "
+            "and search for relaxing music and play it.\n"
+            "Hey buddy, play Hindi songs.\n"
+            "Hey buddy, exit.\n"
+        )
+
+        waiting_for_command = False
+        wake_deadline = None
+
+        while True:
+            timeout = None
+
+            if waiting_for_command:
+                timeout = wake_deadline - time.monotonic()
+
+                if timeout <= 0:
+                    waiting_for_command = False
+                    wake_deadline = None
+                    print("Wake-word timeout.")
+                    continue
+
+                print("\nWaiting for your command...")
+
+            else:
+                print("\nWaiting for sound...")
+
+            recording = record_on_spike(timeout=timeout)
+
+            if recording is None:
+                waiting_for_command = False
+                wake_deadline = None
+                print("Wake-word timeout.")
+                continue
+
+            # Discard brief noises without running Whisper.
+            if recording.size == 0:
+                continue
+
+            print("Transcribing...")
+
+            result = model.transcribe(
+                recording,
+                language="en",
+                fp16=False,
+                condition_on_previous_text=False,
+                beam_size=1,
+                temperature=0.0,
+            )
+
+            heard = result["text"].strip()
+
+            if not heard:
+                print("No text detected.")
+                continue
+
+            print("Heard:", heard)
+
+            wake = re.search(
+                r"\bhey[\s,]+buddy\b",
+                heard,
+                flags=re.IGNORECASE,
+            )
+
+            if wake:
+                command = heard[wake.end():].strip(" ,.!?")
+
+                if not command:
+                    waiting_for_command = True
+                    wake_deadline = (
+                        time.monotonic() + WAKE_TIMEOUT_SECONDS
+                    )
+                    print("Wake word detected. Say your command.")
+                    continue
+
+                waiting_for_command = False
+                wake_deadline = None
+
+            elif waiting_for_command:
+                command = heard.strip(" ,.!?")
+                waiting_for_command = False
+                wake_deadline = None
+
+            else:
+                print("No wake phrase — ignored.")
+                continue
+
+            if not command:
+                continue
+
+            if re.match(
+                COMMAND_START,
+                command,
+                flags=re.IGNORECASE,
+            ):
+                try:
+                    if run_commands(command):
+                        break
+
+                except ValueError as error:
+                    print("Command error:", error)
+                    speak(
+                        "I did not understand the complete command."
+                    )
+
+            else:
+                try:
+                    answer_question(command)
+
+                except Exception as error:
+                    print("AI error:", error)
+                    speak("I could not answer that question.")
+
+    except KeyboardInterrupt:
+        print("\nStopped.")
+
+    except Exception as error:
+        print("Error:", error)
+
+    finally:
+        sd.stop()
+        sock.close()
+        http.close()
+
+        try:
+            if cast is not None:
+                cast.disconnect()
+        finally:
+            engine.stop()
+
+
+if __name__ == "__main__":
+    main()
